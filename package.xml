@@ -2,9 +2,9 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>kfupm_f1tenth_ultra_instinct_v2</name>
-  <version>2.0.0</version>
-  <description>Team Ultra Instinct 2.0 - CIE-KFUPM F1TENTH Autonomous Racing Controller (Stage 2)</description>
-  <maintainer email="raian@kfupm.edu.sa">Team Ultra Instinct 2.0</maintainer>
+  <version>2.1.0</version>
+  <description>Team Ultra Instinct 2.1 - Universal Wide-Radius Momentum Tracker (Stage 2)</description>
+  <maintainer email="raian@kfupm.edu.sa">Team Ultra Instinct 2.1</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
