@@ -4,20 +4,20 @@ CIE-KFUPM F1TENTH Autonomous Racing Competition
 Team: Ultra Instinct 2.1 (Universal Wide-Radius Momentum Tracker)
 Package: kfupm_f1tenth_ultra_instinct_v2
 
-Core Innovations (100% Coordinate-Independent & Universal):
+Core Innovations (100% Universal & Physics-Driven):
 1. Pure Differential Geometry Speed Profiling:
-   - Kinematic curvature profiling v(s) = sqrt(a_lat_max / kappa_eff(s))
+   - Friction-limited velocity v(s) = sqrt(a_lat_max / kappa(s))
    - Smooth backward deceleration pass (a_brake) and forward acceleration pass (a_accel)
    - Zero hardcoded Cartesian (x, y) coordinates; adapts to any circuit geometry.
-2. Perception-Driven Real-Time Corridor Clearance (LiDAR Governor):
-   - Flanking LiDAR sectors dynamically sense local corridor width and lateral obstacle margins.
-   - Automatically modulates entry speed in narrow obstacle pinches/slaloms while unleashing full
-     throttle (5.80 m/s) on open straights.
+2. Full Straightaway Acceleration (Zero Side-Wall Slowdown):
+   - Parallel walls to the side NEVER slow the car down. The vehicle accelerates to maximum
+     speed (5.80 m/s) on all straightaways whenever the road ahead is clear.
+   - Emergency braking triggers ONLY if a wall or obstacle is directly in the forward collision path.
 3. Wide-Radius Dynamic Front-Axle Preview (WRMT):
    - Speed-scaled lookahead chord projection ahead of front axle increases effective turning radius.
 4. Kinematic Stanley Tracking with Active Gyro Yaw Damping:
    - Heading error regulation + cross-track correction + active chassis yaw rate damping.
-5. Multi-Stage Emergency LiDAR Safety Supervisor.
+5. Zero steering-angle braking penalty to preserve kinetic momentum.
 """
 
 import math
@@ -44,13 +44,13 @@ class UltraInstinct21Controller(Node):
         self.max_steer = 0.4189  # ~24 degrees (max servo limit)
 
         # Physical Acceleration & Velocity Limits (Universal Invariants)
-        self.v_max_straight = 5.80   # Top straightaway speed (m/s)
+        self.v_max_straight = 5.80   # Full throttle on all open straightaways (m/s)
         self.v_corner_floor = 2.35   # Apex momentum preservation floor (m/s)
-        self.a_lat_max = 5.80        # Lateral acceleration budget (m/s^2)
+        self.a_lat_max = 5.40        # Physical lateral tire acceleration budget (m/s^2)
         self.a_brake = 4.20          # Kinetic energy preserving deceleration (m/s^2)
         self.a_accel = 5.50          # Punchy corner-exit acceleration (m/s^2)
 
-        # Stanley Tracking & Damping Gains
+        # Stanley Tracking & Active Gyro Damping Gains
         self.k_h = 0.85              # Heading error gain
         self.k_e = 2.80              # Cross-track error gain
         self.k_soft = 0.50           # Low-speed softening constant
@@ -68,13 +68,7 @@ class UltraInstinct21Controller(Node):
         self.last_closest_idx = 0
         self.current_speed = 0.0
         self.last_steer = 0.0
-
-        # LiDAR Perception State
-        self.d_forward = 10.0
-        self.d_left = 5.0
-        self.d_right = 5.0
-        self.d_corridor = 10.0
-        self.d_margin = 5.0
+        self.d_forward_clearance = 10.0
 
         # ROS 2 Subscriptions and Publishers
         self.create_subscription(
@@ -97,7 +91,7 @@ class UltraInstinct21Controller(Node):
 
         self.get_logger().info(
             f"[Ultra Instinct 2.1] Universal Wide-Radius Momentum Tracker Initialized "
-            f"({self.num_pts} waypoints, zero coordinate-checks, max: {self.v_max_straight} m/s)."
+            f"({self.num_pts} waypoints, zero coordinate-checks, max speed: {self.v_max_straight} m/s)."
         )
 
     def _compute_universal_geometry(self):
@@ -120,7 +114,7 @@ class UltraInstinct21Controller(Node):
             headings[i] = math.atan2(dy, dx)
             ds[i] = math.hypot(dx, dy)
 
-            # Menger curvature of 3 consecutive points
+            # Menger circumscribed curvature of 3 consecutive points
             a = math.hypot(p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
             b = math.hypot(p_next[0] - p_curr[0], p_next[1] - p_curr[1])
             c = math.hypot(p_next[0] - p_prev[0], p_next[1] - p_prev[1])
@@ -133,34 +127,25 @@ class UltraInstinct21Controller(Node):
     def _build_universal_velocity_profile(self):
         """
         Universal Physics Speed Profiler:
-        Computes maximum permissible speed based on lateral tire acceleration limits,
-        curvature derivatives, backward braking integration, and forward acceleration integration.
+        Computes maximum permissible speed based on lateral tire friction limits (v = sqrt(a_lat / kappa)),
+        backward kinematic braking integration, and forward kinematic acceleration integration.
         Operates without any map-specific or coordinate-specific conditions.
         """
         n = self.num_pts
 
-        # Window-smoothed curvature across vehicle wheelbase chord (~0.33m)
-        win = 4
+        # Light 3-point noise filter (preserves true peak curvature in slaloms)
+        win = 1
         padded = np.pad(self.curvatures, win, mode='wrap')
-        k_smooth = np.convolve(padded, np.ones(2 * win + 1) / (2 * win + 1), mode='valid')
-
-        # Curvature rate of change |dkappa/ds| (accounts for steering slew rate)
-        dk_ds = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            next_i = (i + 1) % n
-            prev_i = (i - 1) % n
-            denom = max(1e-3, self.ds[i] + self.ds[prev_i])
-            dk_ds[i] = abs(k_smooth[next_i] - k_smooth[prev_i]) / denom
+        k_clean = np.convolve(padded, np.ones(2 * win + 1) / (2 * win + 1), mode='valid')
 
         v_targets = np.zeros(n, dtype=np.float32)
         for i in range(n):
-            # Effective curvature accounts for peak turning radius and chicane transitions
-            k_eff = max(0.035, k_smooth[i] * 0.72 + 0.06 * min(3.0, dk_ds[i]))
+            k_eff = max(0.038, float(k_clean[i]))
             v_corner = math.sqrt(self.a_lat_max / k_eff)
             v_targets[i] = max(self.v_corner_floor, min(self.v_max_straight, v_corner))
 
         # Backward deceleration pass (kinematic energy preservation)
-        for _ in range(3):
+        for _ in range(4):
             for i in range(n - 1, -1, -1):
                 next_i = (i + 1) % n
                 v_lim = math.sqrt(v_targets[next_i]**2 + 2.0 * self.a_brake * self.ds[i])
@@ -168,7 +153,7 @@ class UltraInstinct21Controller(Node):
                     v_targets[i] = v_lim
 
         # Forward acceleration pass onto straightaways
-        for _ in range(3):
+        for _ in range(4):
             for i in range(n):
                 next_i = (i + 1) % n
                 v_lim = math.sqrt(v_targets[i]**2 + 2.0 * self.a_accel * self.ds[i])
@@ -179,32 +164,31 @@ class UltraInstinct21Controller(Node):
 
     def scan_cb(self, scan: LaserScan):
         """
-        Universal LiDAR Perception Supervisor:
-        Extracts forward distance, flanking wall clearances, and total corridor width.
-        Pure sensor-space calculation (zero track coordinates).
+        Forward Direction-of-Travel Collision Envelope:
+        Projects LiDAR rays into the vehicle frame (x=forward, y=lateral).
+        Checks ONLY the vehicle forward travel corridor (|y| <= 0.22m, x > 0).
+        Walls parallel to the car (to the side) NEVER trigger deceleration,
+        allowing full acceleration to maximum speed when the path ahead is clear.
         """
         ranges = np.array(scan.ranges, dtype=np.float32)
-        angle_min = scan.angle_min
-        angle_inc = scan.angle_increment
-        total_rays = len(ranges)
+        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
 
-        def get_min_range(deg_start, deg_end):
-            idx_start = max(0, min(total_rays - 1, int((math.radians(deg_start) - angle_min) / angle_inc)))
-            idx_end = max(0, min(total_rays - 1, int((math.radians(deg_end) - angle_min) / angle_inc)))
-            if idx_start > idx_end:
-                idx_start, idx_end = idx_end, idx_start
-            sector = ranges[idx_start : idx_end + 1]
-            valid = sector[(sector > 0.08) & (~np.isnan(sector)) & (~np.isinf(sector))]
-            return float(np.min(valid)) if len(valid) > 0 else 10.0
+        valid = (ranges > 0.08) & (ranges < 15.0) & (~np.isnan(ranges)) & (~np.isinf(ranges))
+        r_val = ranges[valid]
+        th_val = angles[valid]
 
-        # Forward sector (+/- 10 degrees)
-        self.d_forward = get_min_range(-10, 10)
+        # Vehicle Cartesian coordinates
+        x_pts = r_val * np.cos(th_val)
+        y_pts = r_val * np.sin(th_val)
 
-        # Flanking corridor sectors (detects narrow walls and obstacles)
-        self.d_left = get_min_range(20, 75)
-        self.d_right = get_min_range(-75, -20)
-        self.d_corridor = self.d_left + self.d_right
-        self.d_margin = min(self.d_left, self.d_right)
+        # Forward travel corridor (vehicle width 0.30m -> half-width 0.22m with buffer)
+        corridor_half_width = 0.22
+        in_travel_path = (x_pts > 0.10) & (np.abs(y_pts) <= corridor_half_width)
+
+        if np.any(in_travel_path):
+            self.d_forward_clearance = float(np.min(x_pts[in_travel_path]))
+        else:
+            self.d_forward_clearance = 10.0
 
     def odom_cb(self, odom: Odometry):
         # 1. Vehicle Pose, Heading, and Angular Velocity
@@ -250,29 +234,23 @@ class UltraInstinct21Controller(Node):
         steer_cmd = float(np.clip(total_steer, -self.max_steer, self.max_steer))
         self.last_steer = steer_cmd
 
-        # 6. Geometric Velocity Lookup (Compensates for actuator delay without over-braking)
+        # 6. Geometric Velocity Lookup
+        # When path ahead is clear, accelerates to full straightaway speed (5.80 m/s)
         brake_pts = max(2, min(5, int(self.current_speed * 0.15 / 0.20) + 1))
         target_v = min(self.v_profile[(idx + k) % self.num_pts] for k in range(min(brake_pts, self.num_pts)))
         target_v = min(self.v_max_straight, target_v)
 
-        # 7. Universal Perception Governor (LiDAR-Based Corridor Clearance)
-        # When squeezing through narrow obstacle pinch points (corridor < 1.30m or margin < 0.48m),
-        # smoothly scale velocity ceiling with physical clearance, independent of track/coordinates!
-        if self.d_margin < 0.48 or self.d_corridor < 1.30:
-            clearance_factor = np.clip((self.d_corridor - 0.75) / (1.30 - 0.75), 0.0, 1.0)
-            v_corridor_cap = self.v_corner_floor + (4.00 - self.v_corner_floor) * clearance_factor
-            target_v = min(target_v, float(v_corridor_cap))
-
-        # 8. Emergency Forward Obstacle Supervisor
-        if self.d_forward < 0.50:
+        # 7. Direction-of-Travel Collision Safety Override
+        # Decelerates ONLY if an obstacle or wall is directly in the forward travel corridor
+        if self.d_forward_clearance < 0.50:
             target_v = min(target_v, 1.80)
-        if self.d_forward < 0.30:
-            target_v = 0.0  # Immediate stop
+        if self.d_forward_clearance < 0.32:
+            target_v = 0.0  # Immediate full stop
 
         # Enforce minimum rolling floor
         target_v = max(1.20, target_v)
 
-        # 9. Publish Drive Command
+        # 8. Publish Drive Command
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'ego_racecar/base_link'
