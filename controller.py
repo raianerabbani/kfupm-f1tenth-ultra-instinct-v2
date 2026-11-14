@@ -1,658 +1,42 @@
 #!/usr/bin/env python3
 """
 KFUPM F1TENTH Autonomous Racing Competition - Stage 2
-Team: Ultra Instinct 2.1 (Universal Wide-Radius Momentum Tracker)
+Team: Ultra Instinct 2.1 (Universal Map-to-Raceline Momentum Tracker)
 Standalone Single-File Controller Node
 
 Features:
-- 100% Standalone: Zero external file dependencies (embedded obstacle waypoints)
-- Active LiDAR AEB Supervisor: Continuously monitors /scan for forward collision envelope
+- 100% Universal & Standalone: Zero embedded waypoints, zero external file dependencies
+- Real-Time Map-to-Raceline Generator (/map OccupancyGrid + /ego_racecar/odom initial pose):
+  1. Automatic track loop extraction & open SLAM doorway sealing via Euclidean Distance Transform
+  2. Jordan Curve inner/outer boundary separation & morphological obstacle-protrusion opening
+  3. Zero-level-set contour tracing (Moore-Neighbor 8-connected boundary tracer, zero OpenCV needed)
+  4. Vectorized 2-pass periodic Dynamic Programming (DP) corridor slalom optimization
+  5. Frenet 1D lateral offset smoothing, 2D corner rounding, and periodic cubic B-spline resampling
 - Pure Differential Geometry Speed Profiling: v(s) = sqrt(a_lat_max / kappa(s))
-- Smooth backward deceleration pass (a_brake) and forward acceleration pass (a_accel)
-- Direction-of-Travel Collision Envelope: Parallel walls never cause slowdowns; accelerates to 5.80 m/s
+- Bidirectional kinematic braking (a_brake) and acceleration (a_accel) integration passes
+- Active LiDAR Perception & Forward Collision Envelope (/scan):
+  Parallel side walls never trigger slowdowns; full 5.80 m/s acceleration when path ahead is clear
 - Kinematic Stanley Tracking with Active Gyro Yaw Damping
 """
 
 import math
+import time
 import numpy as np
+from scipy.ndimage import label, distance_transform_edt, gaussian_filter1d
+from scipy.interpolate import splprep, splev
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSProfile,
+    DurabilityPolicy,
+    ReliabilityPolicy,
+    HistoryPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
-
-# Embedded Levine Obstacle Slalom Waypoints (627 points)
-# Guarantees 100% standalone single-file execution in any workspace or autograder.
-LEVINE_SLALOM_WAYPOINTS = [
-    [-12.0000, 0.0000],
-    [-11.9025, -0.0175],
-    [-11.8051, -0.0370],
-    [-11.7076, -0.0581],
-    [-11.6101, -0.0809],
-    [-11.5127, -0.1051],
-    [-11.4152, -0.1306],
-    [-11.3177, -0.1573],
-    [-11.2203, -0.1849],
-    [-11.1228, -0.2133],
-    [-11.0253, -0.2424],
-    [-10.9278, -0.2719],
-    [-10.8304, -0.3019],
-    [-10.7329, -0.3320],
-    [-10.6354, -0.3622],
-    [-10.5380, -0.3922],
-    [-10.4405, -0.4220],
-    [-10.3430, -0.4514],
-    [-10.2456, -0.4802],
-    [-10.1481, -0.5082],
-    [-10.0506, -0.5354],
-    [-9.9532, -0.5615],
-    [-9.8557, -0.5864],
-    [-9.7582, -0.6099],
-    [-9.6608, -0.6319],
-    [-9.5633, -0.6523],
-    [-9.4658, -0.6708],
-    [-9.3683, -0.6874],
-    [-9.2709, -0.7018],
-    [-9.1734, -0.7139],
-    [-9.0759, -0.7236],
-    [-8.9785, -0.7307],
-    [-8.8810, -0.7350],
-    [-8.7835, -0.7364],
-    [-8.6861, -0.7348],
-    [-8.5886, -0.7299],
-    [-8.4884, -0.7305],
-    [-8.3880, -0.7296],
-    [-8.2874, -0.7276],
-    [-8.1867, -0.7250],
-    [-8.0861, -0.7222],
-    [-7.9856, -0.7197],
-    [-7.8852, -0.7179],
-    [-7.7850, -0.7167],
-    [-7.6849, -0.7161],
-    [-7.5849, -0.7159],
-    [-7.4849, -0.7161],
-    [-7.3850, -0.7166],
-    [-7.2852, -0.7174],
-    [-7.1854, -0.7183],
-    [-7.0855, -0.7192],
-    [-6.9857, -0.7201],
-    [-6.8858, -0.7209],
-    [-6.7858, -0.7216],
-    [-6.6859, -0.7222],
-    [-6.5859, -0.7225],
-    [-6.4859, -0.7227],
-    [-6.3858, -0.7226],
-    [-6.2858, -0.7224],
-    [-6.1857, -0.7218],
-    [-6.0857, -0.7210],
-    [-5.9857, -0.7198],
-    [-5.8856, -0.7183],
-    [-5.7856, -0.7165],
-    [-5.6856, -0.7144],
-    [-5.5856, -0.7119],
-    [-5.4856, -0.7091],
-    [-5.3857, -0.7059],
-    [-5.2857, -0.7023],
-    [-5.1858, -0.6985],
-    [-5.0859, -0.6942],
-    [-4.9860, -0.6896],
-    [-4.8862, -0.6846],
-    [-4.7863, -0.6792],
-    [-4.6865, -0.6735],
-    [-4.5867, -0.6675],
-    [-4.4870, -0.6613],
-    [-4.3872, -0.6548],
-    [-4.2874, -0.6483],
-    [-4.1877, -0.6417],
-    [-4.0879, -0.6351],
-    [-3.9881, -0.6286],
-    [-3.8883, -0.6222],
-    [-3.7885, -0.6161],
-    [-3.6886, -0.6102],
-    [-3.5887, -0.6046],
-    [-3.4888, -0.5994],
-    [-3.3888, -0.5947],
-    [-3.2888, -0.5904],
-    [-3.1888, -0.5864],
-    [-3.0887, -0.5827],
-    [-2.9887, -0.5793],
-    [-2.8886, -0.5761],
-    [-2.7886, -0.5731],
-    [-2.6886, -0.5702],
-    [-2.5886, -0.5674],
-    [-2.4886, -0.5646],
-    [-2.3887, -0.5618],
-    [-2.2888, -0.5590],
-    [-2.1890, -0.5560],
-    [-2.0893, -0.5529],
-    [-1.9897, -0.5496],
-    [-1.8901, -0.5462],
-    [-1.7905, -0.5426],
-    [-1.6910, -0.5389],
-    [-1.5914, -0.5353],
-    [-1.4917, -0.5318],
-    [-1.3918, -0.5286],
-    [-1.2918, -0.5257],
-    [-1.1915, -0.5232],
-    [-1.0909, -0.5213],
-    [-0.9900, -0.5199],
-    [-0.8887, -0.5190],
-    [-0.7874, -0.5177],
-    [-0.6863, -0.5151],
-    [-0.5857, -0.5101],
-    [-0.4858, -0.5019],
-    [-0.3869, -0.4895],
-    [-0.2894, -0.4719],
-    [-0.1935, -0.4481],
-    [-0.0992, -0.4178],
-    [-0.0062, -0.3824],
-    [0.0860, -0.3435],
-    [0.1781, -0.3029],
-    [0.2706, -0.2625],
-    [0.3639, -0.2239],
-    [0.4583, -0.1883],
-    [0.5537, -0.1566],
-    [0.6501, -0.1298],
-    [0.7474, -0.1087],
-    [0.8456, -0.0941],
-    [0.9446, -0.0860],
-    [1.0443, -0.0831],
-    [1.1444, -0.0841],
-    [1.2448, -0.0877],
-    [1.3454, -0.0927],
-    [1.4461, -0.0977],
-    [1.5465, -0.1016],
-    [1.6468, -0.1037],
-    [1.7469, -0.1045],
-    [1.8469, -0.1042],
-    [1.9468, -0.1033],
-    [2.0467, -0.1021],
-    [2.1465, -0.1009],
-    [2.2464, -0.1001],
-    [2.3463, -0.1001],
-    [2.4423, -0.0947],
-    [2.5384, -0.0884],
-    [2.6345, -0.0813],
-    [2.7306, -0.0733],
-    [2.8267, -0.0647],
-    [2.9229, -0.0553],
-    [3.0191, -0.0453],
-    [3.1154, -0.0348],
-    [3.2116, -0.0239],
-    [3.3079, -0.0125],
-    [3.4041, -0.0007],
-    [3.5004, 0.0113],
-    [3.5967, 0.0236],
-    [3.6931, 0.0361],
-    [3.7894, 0.0486],
-    [3.8857, 0.0612],
-    [3.9820, 0.0738],
-    [4.0784, 0.0863],
-    [4.1747, 0.0986],
-    [4.2710, 0.1107],
-    [4.3673, 0.1226],
-    [4.4636, 0.1341],
-    [4.5599, 0.1452],
-    [4.6562, 0.1559],
-    [4.7524, 0.1660],
-    [4.8487, 0.1756],
-    [4.9449, 0.1845],
-    [5.0411, 0.1927],
-    [5.1373, 0.2001],
-    [5.2334, 0.2067],
-    [5.3295, 0.2123],
-    [5.4256, 0.2171],
-    [5.5216, 0.2207],
-    [5.6176, 0.2234],
-    [5.7136, 0.2252],
-    [5.8096, 0.2262],
-    [5.9057, 0.2266],
-    [6.0017, 0.2267],
-    [6.0979, 0.2264],
-    [6.1941, 0.2260],
-    [6.2904, 0.2255],
-    [6.3869, 0.2253],
-    [6.4834, 0.2254],
-    [6.5802, 0.2259],
-    [6.6771, 0.2271],
-    [6.7743, 0.2290],
-    [6.8716, 0.2318],
-    [6.9692, 0.2357],
-    [7.0670, 0.2408],
-    [7.1652, 0.2473],
-    [7.2636, 0.2553],
-    [7.3622, 0.2644],
-    [7.4609, 0.2740],
-    [7.5595, 0.2833],
-    [7.6580, 0.2917],
-    [7.7561, 0.2985],
-    [7.8537, 0.3030],
-    [7.9507, 0.3045],
-    [8.0470, 0.3024],
-    [8.1424, 0.2960],
-    [8.2367, 0.2845],
-    [8.3299, 0.2673],
-    [8.4218, 0.2438],
-    [8.5124, 0.2140],
-    [8.6024, 0.1797],
-    [8.6921, 0.1430],
-    [8.7822, 0.1057],
-    [8.8732, 0.0699],
-    [8.9656, 0.0374],
-    [9.0594, 0.0093],
-    [9.1542, -0.0140],
-    [9.2499, -0.0320],
-    [9.3460, -0.0441],
-    [9.4424, -0.0498],
-    [9.5385, -0.0487],
-    [9.6343, -0.0403],
-    [9.7293, -0.0240],
-    [9.8232, 0.0007],
-    [9.9158, 0.0342],
-    [10.0067, 0.0770],
-    [10.0550, 0.1662],
-    [10.0975, 0.2579],
-    [10.1339, 0.3516],
-    [10.1639, 0.4468],
-    [10.1878, 0.5432],
-    [10.2059, 0.6407],
-    [10.2187, 0.7390],
-    [10.2267, 0.8382],
-    [10.2303, 0.9381],
-    [10.2300, 1.0385],
-    [10.2263, 1.1395],
-    [10.2196, 1.2407],
-    [10.2104, 1.3423],
-    [10.1991, 1.4439],
-    [10.1862, 1.5456],
-    [10.1722, 1.6471],
-    [10.1576, 1.7485],
-    [10.1427, 1.8495],
-    [10.1279, 1.9501],
-    [10.1132, 2.0504],
-    [10.0987, 2.1503],
-    [10.0844, 2.2500],
-    [10.0705, 2.3495],
-    [10.0568, 2.4488],
-    [10.0437, 2.5478],
-    [10.0310, 2.6468],
-    [10.0188, 2.7456],
-    [10.0072, 2.8444],
-    [9.9963, 2.9432],
-    [9.9861, 3.0420],
-    [9.9767, 3.1408],
-    [9.9681, 3.2396],
-    [9.9604, 3.3386],
-    [9.9537, 3.4378],
-    [9.9480, 3.5371],
-    [9.9433, 3.6366],
-    [9.9396, 3.7362],
-    [9.9367, 3.8361],
-    [9.9346, 3.9360],
-    [9.9333, 4.0361],
-    [9.9326, 4.1363],
-    [9.9325, 4.2365],
-    [9.9329, 4.3368],
-    [9.9338, 4.4371],
-    [9.9350, 4.5374],
-    [9.9364, 4.6378],
-    [9.9381, 4.7381],
-    [9.9399, 4.8383],
-    [9.9418, 4.9385],
-    [9.9437, 5.0386],
-    [9.9455, 5.1386],
-    [9.9471, 5.2384],
-    [9.9485, 5.3381],
-    [9.9495, 5.4377],
-    [9.9502, 5.5370],
-    [9.9504, 5.6362],
-    [9.9499, 5.7352],
-    [9.9485, 5.8341],
-    [9.9462, 5.9329],
-    [9.9426, 6.0317],
-    [9.9376, 6.1305],
-    [9.9311, 6.2292],
-    [9.9229, 6.3281],
-    [9.9127, 6.4270],
-    [9.9005, 6.5260],
-    [9.8860, 6.6252],
-    [9.8690, 6.7247],
-    [9.8495, 6.8243],
-    [9.8271, 6.9242],
-    [9.8018, 7.0244],
-    [9.7733, 7.1249],
-    [9.7415, 7.2258],
-    [9.7063, 7.3268],
-    [9.6674, 7.4269],
-    [9.6247, 7.5251],
-    [9.5781, 7.6204],
-    [9.5275, 7.7117],
-    [9.4728, 7.7981],
-    [9.4137, 7.8785],
-    [9.3502, 7.9520],
-    [9.2820, 8.0174],
-    [9.2092, 8.0738],
-    [9.1315, 8.1204],
-    [9.0493, 8.1575],
-    [8.9629, 8.1858],
-    [8.8727, 8.2061],
-    [8.7789, 8.2191],
-    [8.6821, 8.2257],
-    [8.5824, 8.2264],
-    [8.4804, 8.2222],
-    [8.3763, 8.2137],
-    [8.2706, 8.2017],
-    [8.1635, 8.1869],
-    [8.0554, 8.1700],
-    [7.9467, 8.1519],
-    [7.8378, 8.1333],
-    [7.7289, 8.1149],
-    [7.6206, 8.0975],
-    [7.5130, 8.0818],
-    [7.4066, 8.0684],
-    [7.3013, 8.0574],
-    [7.1972, 8.0487],
-    [7.0940, 8.0421],
-    [6.9917, 8.0373],
-    [6.8902, 8.0343],
-    [6.7896, 8.0329],
-    [6.6895, 8.0328],
-    [6.5901, 8.0340],
-    [6.4912, 8.0362],
-    [6.3927, 8.0394],
-    [6.2945, 8.0432],
-    [6.1966, 8.0476],
-    [6.0989, 8.0524],
-    [6.0013, 8.0574],
-    [5.9037, 8.0624],
-    [5.8061, 8.0673],
-    [5.7083, 8.0719],
-    [5.6103, 8.0761],
-    [5.5120, 8.0796],
-    [5.4133, 8.0824],
-    [5.3143, 8.0844],
-    [5.2149, 8.0857],
-    [5.1153, 8.0865],
-    [5.0154, 8.0867],
-    [4.9153, 8.0866],
-    [4.8151, 8.0860],
-    [4.7147, 8.0853],
-    [4.6142, 8.0843],
-    [4.5137, 8.0832],
-    [4.4132, 8.0821],
-    [4.3127, 8.0810],
-    [4.2122, 8.0801],
-    [4.1119, 8.0794],
-    [4.0116, 8.0789],
-    [3.9115, 8.0785],
-    [3.8114, 8.0784],
-    [3.7114, 8.0783],
-    [3.6114, 8.0784],
-    [3.5115, 8.0786],
-    [3.4116, 8.0788],
-    [3.3117, 8.0791],
-    [3.2119, 8.0794],
-    [3.1120, 8.0797],
-    [3.0121, 8.0800],
-    [2.9123, 8.0802],
-    [2.8124, 8.0804],
-    [2.7124, 8.0806],
-    [2.6125, 8.0807],
-    [2.5125, 8.0808],
-    [2.4126, 8.0808],
-    [2.3126, 8.0809],
-    [2.2126, 8.0809],
-    [2.1126, 8.0809],
-    [2.0126, 8.0808],
-    [1.9125, 8.0808],
-    [1.8125, 8.0807],
-    [1.7125, 8.0806],
-    [1.6124, 8.0805],
-    [1.5124, 8.0804],
-    [1.4123, 8.0803],
-    [1.3123, 8.0803],
-    [1.2122, 8.0802],
-    [1.1122, 8.0801],
-    [1.0122, 8.0800],
-    [0.9121, 8.0799],
-    [0.8121, 8.0799],
-    [0.7121, 8.0799],
-    [0.6121, 8.0798],
-    [0.5121, 8.0798],
-    [0.4121, 8.0798],
-    [0.3121, 8.0798],
-    [0.2121, 8.0798],
-    [0.1121, 8.0798],
-    [0.0121, 8.0799],
-    [-0.0879, 8.0799],
-    [-0.1879, 8.0799],
-    [-0.2879, 8.0799],
-    [-0.3879, 8.0799],
-    [-0.4879, 8.0800],
-    [-0.5879, 8.0800],
-    [-0.6879, 8.0800],
-    [-0.7879, 8.0800],
-    [-0.8878, 8.0800],
-    [-0.9878, 8.0800],
-    [-1.0878, 8.0800],
-    [-1.1878, 8.0800],
-    [-1.2878, 8.0800],
-    [-1.3878, 8.0799],
-    [-1.4878, 8.0799],
-    [-1.5878, 8.0799],
-    [-1.6878, 8.0798],
-    [-1.7878, 8.0798],
-    [-1.8878, 8.0798],
-    [-1.9878, 8.0797],
-    [-2.0878, 8.0797],
-    [-2.1878, 8.0797],
-    [-2.2878, 8.0797],
-    [-2.3878, 8.0797],
-    [-2.4878, 8.0797],
-    [-2.5878, 8.0797],
-    [-2.6878, 8.0798],
-    [-2.7878, 8.0798],
-    [-2.8878, 8.0799],
-    [-2.9878, 8.0800],
-    [-3.0878, 8.0801],
-    [-3.1878, 8.0802],
-    [-3.2878, 8.0803],
-    [-3.3878, 8.0804],
-    [-3.4878, 8.0806],
-    [-3.5878, 8.0807],
-    [-3.6878, 8.0807],
-    [-3.7878, 8.0808],
-    [-3.8878, 8.0808],
-    [-3.9878, 8.0808],
-    [-4.0878, 8.0808],
-    [-4.1878, 8.0807],
-    [-4.2878, 8.0805],
-    [-4.3878, 8.0803],
-    [-4.4878, 8.0800],
-    [-4.5879, 8.0797],
-    [-4.6879, 8.0794],
-    [-4.7879, 8.0791],
-    [-4.8880, 8.0790],
-    [-4.9880, 8.0791],
-    [-5.0880, 8.0796],
-    [-5.1880, 8.0805],
-    [-5.2880, 8.0819],
-    [-5.3880, 8.0839],
-    [-5.4880, 8.0866],
-    [-5.5879, 8.0899],
-    [-5.6878, 8.0942],
-    [-5.7877, 8.0993],
-    [-5.8875, 8.1054],
-    [-5.9873, 8.1126],
-    [-6.0871, 8.1208],
-    [-6.1867, 8.1301],
-    [-6.2863, 8.1404],
-    [-6.3857, 8.1519],
-    [-6.4850, 8.1646],
-    [-6.5841, 8.1784],
-    [-6.6831, 8.1934],
-    [-6.7818, 8.2096],
-    [-6.8804, 8.2271],
-    [-6.9787, 8.2458],
-    [-7.0768, 8.2658],
-    [-7.1746, 8.2872],
-    [-7.2720, 8.3102],
-    [-7.3690, 8.3348],
-    [-7.4655, 8.3613],
-    [-7.5615, 8.3897],
-    [-7.6568, 8.4203],
-    [-7.7514, 8.4532],
-    [-7.8453, 8.4884],
-    [-7.9384, 8.5262],
-    [-8.0306, 8.5667],
-    [-8.1218, 8.6101],
-    [-8.2121, 8.6564],
-    [-8.3013, 8.7056],
-    [-8.3898, 8.7568],
-    [-8.4777, 8.8091],
-    [-8.5655, 8.8614],
-    [-8.6533, 8.9129],
-    [-8.7413, 8.9625],
-    [-8.8300, 9.0093],
-    [-8.9195, 9.0523],
-    [-9.0101, 9.0905],
-    [-9.1020, 9.1231],
-    [-9.1956, 9.1490],
-    [-9.2911, 9.1675],
-    [-9.3882, 9.1793],
-    [-9.4868, 9.1853],
-    [-9.5865, 9.1866],
-    [-9.6871, 9.1841],
-    [-9.7884, 9.1789],
-    [-9.8902, 9.1719],
-    [-9.9921, 9.1641],
-    [-10.0939, 9.1566],
-    [-10.1953, 9.1502],
-    [-10.2963, 9.1459],
-    [-10.3967, 9.1435],
-    [-10.4968, 9.1427],
-    [-10.5965, 9.1430],
-    [-10.6961, 9.1442],
-    [-10.7957, 9.1458],
-    [-10.8953, 9.1476],
-    [-10.9950, 9.1491],
-    [-11.0950, 9.1501],
-    [-11.1954, 9.1500],
-    [-11.2962, 9.1487],
-    [-11.3972, 9.1456],
-    [-11.4983, 9.1403],
-    [-11.5991, 9.1324],
-    [-11.6994, 9.1215],
-    [-11.7990, 9.1070],
-    [-11.8977, 9.0887],
-    [-11.9951, 9.0659],
-    [-12.0910, 9.0384],
-    [-12.1853, 9.0057],
-    [-12.2776, 8.9673],
-    [-12.3678, 8.9235],
-    [-12.4556, 8.8745],
-    [-12.5409, 8.8207],
-    [-12.6235, 8.7622],
-    [-12.7033, 8.6995],
-    [-12.7800, 8.6329],
-    [-12.8534, 8.5626],
-    [-12.9235, 8.4890],
-    [-12.9899, 8.4124],
-    [-13.0525, 8.3330],
-    [-13.1114, 8.2510],
-    [-13.1667, 8.1668],
-    [-13.2184, 8.0804],
-    [-13.2667, 7.9921],
-    [-13.3117, 7.9021],
-    [-13.3535, 7.8105],
-    [-13.3922, 7.7176],
-    [-13.4278, 7.6235],
-    [-13.4606, 7.5284],
-    [-13.4905, 7.4326],
-    [-13.5177, 7.3361],
-    [-13.5424, 7.2392],
-    [-13.5646, 7.1419],
-    [-13.5845, 7.0441],
-    [-13.6023, 6.9458],
-    [-13.6180, 6.8473],
-    [-13.6318, 6.7483],
-    [-13.6439, 6.6491],
-    [-13.6543, 6.5496],
-    [-13.6633, 6.4498],
-    [-13.6709, 6.3497],
-    [-13.6773, 6.2495],
-    [-13.6826, 6.1491],
-    [-13.6869, 6.0486],
-    [-13.6905, 5.9479],
-    [-13.6934, 5.8472],
-    [-13.6957, 5.7463],
-    [-13.6976, 5.6455],
-    [-13.6993, 5.5447],
-    [-13.7008, 5.4439],
-    [-13.7023, 5.3431],
-    [-13.7037, 5.2424],
-    [-13.7050, 5.1418],
-    [-13.7061, 5.0412],
-    [-13.7071, 4.9406],
-    [-13.7080, 4.8402],
-    [-13.7088, 4.7398],
-    [-13.7093, 4.6395],
-    [-13.7097, 4.5393],
-    [-13.7099, 4.4393],
-    [-13.7099, 4.3393],
-    [-13.7097, 4.2394],
-    [-13.7093, 4.1396],
-    [-13.7086, 4.0400],
-    [-13.7076, 3.9405],
-    [-13.7064, 3.8411],
-    [-13.7049, 3.7418],
-    [-13.7031, 3.6427],
-    [-13.7010, 3.5438],
-    [-13.6986, 3.4450],
-    [-13.6958, 3.3464],
-    [-13.6926, 3.2478],
-    [-13.6889, 3.1493],
-    [-13.6847, 3.0509],
-    [-13.6798, 2.9525],
-    [-13.6743, 2.8540],
-    [-13.6680, 2.7555],
-    [-13.6609, 2.6569],
-    [-13.6530, 2.5581],
-    [-13.6441, 2.4592],
-    [-13.6342, 2.3600],
-    [-13.6233, 2.2607],
-    [-13.6112, 2.1610],
-    [-13.5979, 2.0611],
-    [-13.5834, 1.9608],
-    [-13.5676, 1.8601],
-    [-13.5504, 1.7591],
-    [-13.5318, 1.6576],
-    [-13.5116, 1.5556],
-    [-13.4899, 1.4531],
-    [-13.4663, 1.3504],
-    [-13.4406, 1.2480],
-    [-13.4123, 1.1466],
-    [-13.3809, 1.0467],
-    [-13.3462, 0.9490],
-    [-13.3076, 0.8541],
-    [-13.2648, 0.7625],
-    [-13.2173, 0.6749],
-    [-13.1648, 0.5919],
-    [-13.1069, 0.5140],
-    [-13.0431, 0.4419],
-    [-12.9730, 0.3762],
-    [-12.8968, 0.3170],
-    [-12.8149, 0.2640],
-    [-12.7282, 0.2167],
-    [-12.6372, 0.1746],
-    [-12.5426, 0.1374],
-    [-12.4452, 0.1044],
-    [-12.3456, 0.0754],
-    [-12.2445, 0.0499],
-    [-12.1425, 0.0273],
-    [-12.0404, 0.0073]
-]
 
 
 class UltraInstinct21Controller(Node):
@@ -676,42 +60,397 @@ class UltraInstinct21Controller(Node):
         self.k_soft = 0.50           # Low-speed softening constant
         self.k_yaw = 0.018           # Active gyro yaw-rate damping gain
 
-        # Load Embedded Waypoints (x, y)
-        self.wps = np.array(LEVINE_SLALOM_WAYPOINTS, dtype=np.float32)
-        self.num_pts = len(self.wps)
+        # Dynamic Raceline State (populated automatically from /map + /ego_racecar/odom)
+        self.wps = None
+        self.num_pts = 0
+        self.headings = None
+        self.curvatures = None
+        self.ds = None
+        self.v_profile = None
+        self.raceline_ready = False
+        self.map_msg = None
+        self.init_pose = None
 
-        # Compute Universal Geometric Properties (Pure Differential Geometry)
-        self.headings, self.curvatures, self.ds = self._compute_universal_geometry()
-        self.v_profile = self._build_universal_velocity_profile()
-
-        # Real-time state
+        # Real-time tracking & perception state
         self.last_closest_idx = 0
         self.current_speed = 0.0
         self.last_steer = 0.0
         self.d_forward_clearance = 10.0
 
+        # QoS for /map (nav2_map_server uses TRANSIENT_LOCAL + RELIABLE)
+        map_qos_latched = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        map_qos_volatile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
         # ROS 2 Subscriptions and Publishers
+        self.map_sub_latched = self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_cb,
+            qos_profile=map_qos_latched,
+        )
+        self.map_sub_volatile = self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_cb,
+            qos_profile=map_qos_volatile,
+        )
         self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_cb,
-            qos_profile=qos_profile_sensor_data
+            qos_profile=qos_profile_sensor_data,
         )
         self.odom_sub = self.create_subscription(
             Odometry,
             '/ego_racecar/odom',
             self.odom_cb,
-            10
+            10,
         )
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped,
             '/drive',
-            10
+            10,
         )
 
         self.get_logger().info(
-            f"[Ultra Instinct 2.1] Standalone Single-File Controller Initialized "
-            f"({self.num_pts} waypoints, active LiDAR AEB, max speed: {self.v_max_straight} m/s)."
+            "[Ultra Instinct 2.1] Universal Map-to-Raceline Controller Initialized. "
+            "Waiting for /map and /ego_racecar/odom..."
+        )
+
+    def map_cb(self, msg: OccupancyGrid):
+        """Receives the OccupancyGrid map and triggers raceline generation once pose is known."""
+        if self.map_msg is None:
+            self.map_msg = msg
+            self.get_logger().info(
+                f"[Ultra Instinct 2.1] Received /map ({msg.info.width}x{msg.info.height}, "
+                f"res={msg.info.resolution:.3f}m)."
+            )
+            if self.init_pose is not None and not self.raceline_ready:
+                self._initialize_raceline()
+
+    @staticmethod
+    def _trace_outer_contour(mask_bool: np.ndarray) -> np.ndarray:
+        """
+        Pure-Python Moore-Neighbor 8-connected boundary tracer.
+        Extracts the ordered closed outer contour (col, row) of the largest connected component
+        in `mask_bool` without requiring OpenCV (cv2).
+        """
+        ih_labels, _ = label(mask_bool, structure=np.ones((3, 3), dtype=int))
+        ih_sizes = np.bincount(ih_labels.ravel())
+        ih_sizes[0] = 0
+        blob = ih_labels == int(np.argmax(ih_sizes))
+        rs, cs = np.where(blob)
+        r_start, c_start = int(rs[0]), int(cs[0])
+
+        dirs = [(0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)]
+        contour = [(c_start, r_start)]
+        cr, cc = r_start, c_start
+        back_dir = 6  # Came from North (-1, 0) since top-left pixel has no North neighbor
+        H, W = blob.shape
+
+        max_steps = len(rs) * 2 + 1000
+        for _ in range(max_steps):
+            found = False
+            for k in range(1, 9):
+                d_idx = (back_dir + k) % 8
+                nr, nc = cr + dirs[d_idx][0], cc + dirs[d_idx][1]
+                if 0 <= nr < H and 0 <= nc < W and blob[nr, nc]:
+                    cr, cc = nr, nc
+                    back_dir = (d_idx + 4) % 8
+                    found = True
+                    break
+            if not found or (cr == r_start and cc == c_start and len(contour) > 20):
+                break
+            contour.append((cc, cr))
+
+        return np.array(contour, dtype=np.float64)
+
+    def _generate_raceline_from_map(self, msg: OccupancyGrid, sx: float, sy: float, stheta: float) -> np.ndarray:
+        """
+        Universal Map-to-Raceline Generator:
+        Synthesizes a smooth, collision-free, curvature-minimized closed-loop raceline
+        directly from any 2D OccupancyGrid and the vehicle's starting pose (sx, sy, stheta).
+        """
+        w_full = int(msg.info.width)
+        h_full = int(msg.info.height)
+        res = float(msg.info.resolution)
+        ox = float(msg.info.origin.position.x)
+        oy = float(msg.info.origin.position.y)
+
+        occ_grid = np.array(msg.data, dtype=np.int8).reshape((h_full, w_full))
+
+        # 1. Crop tightly to the occupied map bounding box (+20px margin) for ~10x speedup
+        occ_r, occ_c = np.where(occ_grid >= 50)
+        if len(occ_r) > 0:
+            r_min = max(0, int(occ_r.min()) - 20)
+            r_max = min(h_full, int(occ_r.max()) + 21)
+            c_min = max(0, int(occ_c.min()) - 20)
+            c_max = min(w_full, int(occ_c.max()) + 21)
+        else:
+            r_min, r_max, c_min, c_max = 0, h_full, 0, w_full
+
+        occ_sub = occ_grid[r_min:r_max, c_min:c_max]
+        ox_sub = ox + c_min * res
+        oy_sub = oy + r_min * res
+        H, W = occ_sub.shape
+
+        # 2. Euclidean Distance Transform (EDT) & gradient on real obstacle/wall grid
+        walls = (occ_sub >= 50) | (occ_sub < 0)
+        dist_m = distance_transform_edt(~walls) * res
+        grad_r, grad_c = np.gradient(dist_m)
+        grad_norm = np.hypot(grad_r, grad_c) + 1e-8
+        grad_x = grad_c / grad_norm
+        grad_y = grad_r / grad_norm
+
+        # 3. Seal open SLAM doorways into exterior voids using local corridor width
+        c0 = int(np.clip(round((sx - ox_sub) / res), 0, W - 1))
+        r0 = int(np.clip(round((sy - oy_sub) / res), 0, H - 1))
+        local_r = float(dist_m[max(0, r0 - 15):min(H, r0 + 16), max(0, c0 - 15):min(W, c0 + 16)].max())
+        max_track_half_width = max(3.5, local_r * 2.0)
+
+        ext_core = dist_m > max_track_half_width
+        if np.any(ext_core):
+            exterior_void = (distance_transform_edt(~ext_core) * res) <= (max_track_half_width + 0.05)
+        else:
+            exterior_void = np.zeros_like(walls)
+
+        # 4. Identify and remove small isolated obstacle islands (< 3.5 m^2) to extract clean track topology
+        non_track = walls | exterior_void
+        non_track[0, :] = True
+        non_track[-1, :] = True
+        non_track[:, 0] = True
+        non_track[:, -1] = True
+
+        wall_labels, _ = label(non_track, structure=np.ones((3, 3), dtype=int))
+        comp_sizes = np.bincount(wall_labels.ravel())
+        max_obs_pixels = int(round(3.5 / (res ** 2)))
+        is_small_obs = (wall_labels > 0) & (comp_sizes[wall_labels] < max_obs_pixels)
+
+        clean_walls = non_track & (~is_small_obs)
+        clean_dist_m = distance_transform_edt(~clean_walls) * res
+
+        drivable_clean = clean_dist_m >= (res * 1.2)
+        labeled, _ = label(drivable_clean, structure=np.ones((3, 3), dtype=int))
+        cid = int(labeled[r0, c0])
+        if cid == 0:
+            win = max(3, int(round(0.6 / res)))
+            sub_l = labeled[max(0, r0 - win):min(H, r0 + win + 1), max(0, c0 - win):min(W, c0 + win + 1)]
+            nz = sub_l[sub_l > 0]
+            if len(nz) > 0:
+                cid = int(np.bincount(nz).argmax())
+        track_mask = labeled == cid
+
+        # 5. Jordan Curve Inner/Outer Boundary Separation + Morphological Opening of Wall-Attached Obstacles
+        boundary_walls = ~track_mask
+        boundary_walls[0, :] = True
+        boundary_walls[-1, :] = True
+        boundary_walls[:, 0] = True
+        boundary_walls[:, -1] = True
+
+        bw_labels, _ = label(boundary_walls, structure=np.ones((3, 3), dtype=int))
+        outer_cid = int(bw_labels[0, 0])
+        bw_sizes = np.bincount(bw_labels.ravel())
+        bw_sizes[0] = 0
+        bw_sizes[outer_cid] = 0
+        inner_cid = int(np.argmax(bw_sizes))
+
+        r_open = min(0.65, local_r * 0.80)
+        outer_raw = bw_labels == outer_cid
+        inner_raw = bw_labels == inner_cid
+
+        outer_core = (distance_transform_edt(outer_raw) * res) >= r_open
+        outer_smooth = (distance_transform_edt(~outer_core) * res) <= r_open if np.any(outer_core) else outer_raw
+        inner_core = (distance_transform_edt(inner_raw) * res) >= r_open
+        inner_smooth = (distance_transform_edt(~inner_core) * res) <= r_open if np.any(inner_core) else inner_raw
+
+        d_outer = distance_transform_edt(~outer_smooth) * res
+        d_inner = distance_transform_edt(~inner_smooth) * res
+
+        # 6. Zero-Level-Set Reference Centerline Extraction (d_outer == d_inner)
+        inner_half_bool = (d_outer >= d_inner) & (~outer_smooth)
+        main_contour = self._trace_outer_contour(inner_half_bool)
+        raw_pts = np.column_stack([ox_sub + main_contour[:, 0] * res, oy_sub + main_contour[:, 1] * res])
+
+        # Align index 0 to vehicle starting position and orient along initial heading stheta
+        idx0 = int(np.argmin((raw_pts[:, 0] - sx) ** 2 + (raw_pts[:, 1] - sy) ** 2))
+        raw_pts = np.roll(raw_pts, -idx0, axis=0)
+        tang = raw_pts[min(5, len(raw_pts) - 1)] - raw_pts[0]
+        if tang[0] * math.cos(stheta) + tang[1] * math.sin(stheta) < 0:
+            raw_pts = np.vstack([raw_pts[0:1], raw_pts[1:][::-1]])
+
+        sub_step = max(1, int(round(0.12 / res)))
+        raw_pts = gaussian_filter1d(raw_pts, sigma=0.35 / res, axis=0, mode='wrap')[::sub_step]
+        N = len(raw_pts)
+
+        # Compute reference tangents, normals, and curvatures
+        p_prev = np.roll(raw_pts, 1, axis=0)
+        p_next = np.roll(raw_pts, -1, axis=0)
+        t_vec = p_next - p_prev
+        tangents = t_vec / (np.linalg.norm(t_vec, axis=1, keepdims=True) + 1e-6)
+        area = 0.5 * (
+            p_prev[:, 0] * (raw_pts[:, 1] - p_next[:, 1])
+            + raw_pts[:, 0] * (p_next[:, 1] - p_prev[:, 1])
+            + p_next[:, 0] * (p_prev[:, 1] - raw_pts[:, 1])
+        )
+        d123 = (
+            np.linalg.norm(p_prev - raw_pts, axis=1)
+            * np.linalg.norm(raw_pts - p_next, axis=1)
+            * np.linalg.norm(p_next - p_prev, axis=1)
+        )
+        curvatures = np.where(d123 > 1e-6, 4.0 * area / d123, 0.0)
+        normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+
+        # 7. Vectorized 2-Pass Periodic Dynamic Programming (DP) Corridor Slalom
+        max_dev = min(2.2, max(0.95, local_r * 1.3))
+        states = np.linspace(-max_dev, max_dev, 91)
+        K = len(states)
+        col_thresh = 0.24
+        safety_margin = 0.36
+
+        cand_x = raw_pts[:, 0, None] + states[None, :] * normals[:, 0, None]
+        cand_y = raw_pts[:, 1, None] + states[None, :] * normals[:, 1, None]
+        cpx = np.clip(np.round((cand_x - ox_sub) / res).astype(int), 0, W - 1)
+        cpy = np.clip(np.round((cand_y - oy_sub) / res).astype(int), 0, H - 1)
+        in_bounds = (
+            (cand_x >= ox_sub)
+            & (cand_x < ox_sub + W * res)
+            & (cand_y >= oy_sub)
+            & (cand_y < oy_sub + H * res)
+        )
+        valid_cell = (
+            in_bounds
+            & track_mask[cpy, cpx]
+            & (~walls[cpy, cpx])
+            & ((1.0 - curvatures[:, None] * states[None, :]) >= 0.25)
+        )
+        c_grid = dist_m[cpy, cpx]
+        u2 = 0.05 * (states[None, :] ** 2)
+
+        cost_grid = np.where(
+            ~valid_cell,
+            1e8,
+            np.where(
+                c_grid < col_thresh,
+                1e7 * (col_thresh - c_grid) + 1e5,
+                np.where(
+                    c_grid < safety_margin,
+                    2500.0 * ((safety_margin - c_grid) ** 2) + u2,
+                    u2 - 2.0 * np.minimum(c_grid, safety_margin + 0.06),
+                ),
+            ),
+        )
+
+        w_smooth = 250.0
+        diff = states[None, :] - states[:, None]
+        trans = np.where(np.abs(diff) > 0.20, 1e8, w_smooth * (diff ** 2))
+
+        # Pass 1: find optimal periodic boundary state at index 0
+        dp1 = np.zeros((N, K), dtype=np.float64)
+        dp1[0] = cost_grid[0]
+        for i in range(1, N):
+            dp1[i] = np.min(dp1[i - 1, :, None] + trans + cost_grid[i, None, :], axis=0)
+        best_k = int(np.argmin(dp1[-1] + w_smooth * (states ** 2)))
+
+        # Pass 2: backtrack optimal periodic offset trajectory u*(s)
+        dp2 = np.full((N, K), 1e8, dtype=np.float64)
+        parent2 = np.zeros((N, K), dtype=int)
+        dp2[0, best_k] = cost_grid[0, best_k]
+        for i in range(1, N):
+            total = dp2[i - 1, :, None] + trans + cost_grid[i, None, :]
+            parent2[i] = np.argmin(total, axis=0)
+            dp2[i] = np.min(total, axis=0)
+
+        opt_offsets = np.zeros(N, dtype=np.float64)
+        curr_k = best_k
+        opt_offsets[-1] = states[curr_k]
+        for i in range(N - 2, -1, -1):
+            curr_k = parent2[i + 1, curr_k]
+            opt_offsets[i] = states[curr_k]
+
+        # 8. Frenet 1D Offset Smoothing + Gentle 2D Corner Rounding + Periodic B-Spline Resampling
+        smoothed_u = opt_offsets.copy()
+        cpx0 = np.clip(np.round(((raw_pts[:, 0] + smoothed_u * normals[:, 0]) - ox_sub) / res).astype(int), 0, W - 1)
+        cpy0 = np.clip(np.round(((raw_pts[:, 1] + smoothed_u * normals[:, 1]) - oy_sub) / res).astype(int), 0, H - 1)
+        req_c = np.minimum(0.35, np.maximum(0.24, dist_m[cpy0, cpx0] - 0.01))
+
+        for stride in [8, 4, 2, 1]:
+            for _ in range(35):
+                mid_u = 0.5 * (np.roll(smoothed_u, stride) + np.roll(smoothed_u, -stride))
+                cand_u = smoothed_u + 0.35 * (mid_u - smoothed_u)
+                cx_u = raw_pts[:, 0] + cand_u * normals[:, 0]
+                cy_u = raw_pts[:, 1] + cand_u * normals[:, 1]
+                cpx = np.clip(np.round((cx_u - ox_sub) / res).astype(int), 0, W - 1)
+                cpy = np.clip(np.round((cy_u - oy_sub) / res).astype(int), 0, H - 1)
+                valid = track_mask[cpy, cpx] & (~walls[cpy, cpx]) & (dist_m[cpy, cpx] >= req_c)
+                smoothed_u[valid] = cand_u[valid]
+
+        safe_pts = raw_pts + normals * gaussian_filter1d(smoothed_u, sigma=1.5, mode='wrap')[:, None]
+
+        cpx0 = np.clip(np.round((safe_pts[:, 0] - ox_sub) / res).astype(int), 0, W - 1)
+        cpy0 = np.clip(np.round((safe_pts[:, 1] - oy_sub) / res).astype(int), 0, H - 1)
+        local_max_c = np.minimum(0.36, np.maximum(0.24, dist_m[cpy0, cpx0] - 0.01))
+        opt_pts = safe_pts.copy()
+
+        for stride in [3, 2, 1]:
+            for _ in range(20):
+                mid = 0.5 * (np.roll(opt_pts, stride, axis=0) + np.roll(opt_pts, -stride, axis=0))
+                cand_pts = opt_pts + 0.30 * (mid - opt_pts)
+                cpx = np.clip(np.round((cand_pts[:, 0] - ox_sub) / res).astype(int), 0, W - 1)
+                cpy = np.clip(np.round((cand_pts[:, 1] - oy_sub) / res).astype(int), 0, H - 1)
+                valid = track_mask[cpy, cpx] & (~walls[cpy, cpx]) & (dist_m[cpy, cpx] >= local_max_c)
+                opt_pts[valid] = cand_pts[valid]
+
+        # Enforce minimum 0.25m obstacle clearance prior to B-spline fit to preserve C2 continuity
+        for _ in range(3):
+            cpx = np.clip(np.round((opt_pts[:, 0] - ox_sub) / res).astype(int), 0, W - 1)
+            cpy = np.clip(np.round((opt_pts[:, 1] - oy_sub) / res).astype(int), 0, H - 1)
+            c_val = dist_m[cpy, cpx]
+            need = c_val < 0.25
+            if not np.any(need):
+                break
+            opt_pts[need, 0] += (0.26 - c_val[need]) * grad_x[cpy[need], cpx[need]]
+            opt_pts[need, 1] += (0.26 - c_val[need]) * grad_y[cpy[need], cpx[need]]
+
+        tck, _ = splprep([opt_pts[:, 0], opt_pts[:, 1]], s=0.005, per=True)
+        u_dense = np.linspace(0.0, 1.0, 5000)
+        xd, yd = splev(u_dense, tck)
+        cum_s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xd), np.diff(yd)))])
+        total_len = float(cum_s[-1])
+        num_wps = max(50, int(round(total_len / 0.10)))
+        u_target = np.interp(np.linspace(0.0, total_len, num_wps, endpoint=False), cum_s, u_dense)
+        rx, ry = splev(u_target, tck)
+        wps = np.column_stack([rx, ry]).astype(np.float32)
+
+        return wps
+
+    def _initialize_raceline(self):
+        """Generates the raceline and velocity profile from /map and initial pose."""
+        if self.raceline_ready or self.map_msg is None or self.init_pose is None:
+            return
+
+        t0 = time.time()
+        sx, sy, stheta = self.init_pose
+        self.wps = self._generate_raceline_from_map(self.map_msg, sx, sy, stheta)
+        self.num_pts = len(self.wps)
+        self.headings, self.curvatures, self.ds = self._compute_universal_geometry()
+        self.v_profile = self._build_universal_velocity_profile()
+        self.last_closest_idx = 0
+        self.raceline_ready = True
+        dt_ms = (time.time() - t0) * 1000.0
+
+        self.get_logger().info(
+            f"[Ultra Instinct 2.1] Generated {self.num_pts} universal raceline waypoints from /map "
+            f"in {dt_ms:.1f} ms (v_min={self.v_profile.min():.2f} m/s, v_max={self.v_profile.max():.2f} m/s)."
         )
 
     def _compute_universal_geometry(self):
@@ -768,7 +507,7 @@ class UltraInstinct21Controller(Node):
         for _ in range(4):
             for i in range(n - 1, -1, -1):
                 next_i = (i + 1) % n
-                v_lim = math.sqrt(v_targets[next_i]**2 + 2.0 * self.a_brake * self.ds[i])
+                v_lim = math.sqrt(v_targets[next_i] ** 2 + 2.0 * self.a_brake * self.ds[i])
                 if v_targets[i] > v_lim:
                     v_targets[i] = v_lim
 
@@ -776,7 +515,7 @@ class UltraInstinct21Controller(Node):
         for _ in range(4):
             for i in range(n):
                 next_i = (i + 1) % n
-                v_lim = math.sqrt(v_targets[i]**2 + 2.0 * self.a_accel * self.ds[i])
+                v_lim = math.sqrt(v_targets[i] ** 2 + 2.0 * self.a_accel * self.ds[i])
                 if v_targets[next_i] > v_lim:
                     v_targets[next_i] = v_lim
 
@@ -786,12 +525,12 @@ class UltraInstinct21Controller(Node):
         """
         Active LiDAR Perception & Forward Collision Envelope:
         Projects LiDAR rays into the vehicle frame (x=forward, y=lateral).
-        Checks the vehicle forward travel corridor (|y| <= 0.22m, x > 0).
+        Checks the vehicle forward travel corridor (|y| <= 0.22m, x > 0.10m).
         Walls parallel to the car (to the side) NEVER trigger deceleration,
         allowing full acceleration to maximum speed when the path ahead is clear.
         """
         ranges = np.array(scan.ranges, dtype=np.float32)
-        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
+        angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
 
         valid = (ranges > 0.08) & (ranges < 15.0) & (~np.isnan(ranges)) & (~np.isinf(ranges))
         r_val = ranges[valid]
@@ -819,6 +558,15 @@ class UltraInstinct21Controller(Node):
         yaw_rate = odom.twist.twist.angular.z
         self.current_speed = math.hypot(odom.twist.twist.linear.x, odom.twist.twist.linear.y)
 
+        # Capture initial pose and synthesize raceline if /map has arrived
+        if self.init_pose is None:
+            self.init_pose = (xc, yc, yaw)
+            if self.map_msg is not None and not self.raceline_ready:
+                self._initialize_raceline()
+
+        if not self.raceline_ready:
+            return
+
         # 2. Dynamic Front Axle Preview (scales smoothly with velocity)
         preview_dist = max(0.12, min(0.20, 0.10 + 0.02 * self.current_speed))
         xf = xc + (self.wheelbase + preview_dist) * math.cos(yaw)
@@ -828,7 +576,7 @@ class UltraInstinct21Controller(Node):
         search_radius = min(self.num_pts // 2, 80)
         idx_win = [(self.last_closest_idx + offset) % self.num_pts for offset in range(-search_radius, search_radius)]
         wps_win = self.wps[idx_win]
-        dists_sq = (wps_win[:, 0] - xf)**2 + (wps_win[:, 1] - yf)**2
+        dists_sq = (wps_win[:, 0] - xf) ** 2 + (wps_win[:, 1] - yf) ** 2
         min_win_idx = int(np.argmin(dists_sq))
         idx = idx_win[min_win_idx]
         self.last_closest_idx = idx

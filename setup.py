@@ -1,6 +1,4 @@
 from setuptools import find_packages, setup
-import os
-from glob import glob
 
 package_name = 'kfupm_f1tenth_ultra_instinct_v2'
 
@@ -12,13 +10,12 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'racelines'), glob('racelines/*.csv')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='Team Ultra Instinct 2.1',
     maintainer_email='raian@kfupm.edu.sa',
-    description='Team Ultra Instinct 2.1 - Universal Wide-Radius Momentum Tracker (Stage 2)',
+    description='Team Ultra Instinct 2.1 - Universal Map-to-Raceline Momentum Tracker (Stage 2)',
     license='MIT',
     extras_require={
         'test': [
