@@ -1,23 +1,4 @@
-#!/usr/bin/env python3
-"""
-KFUPM F1TENTH Autonomous Racing Competition - Stage 2
-Team: Ultra Instinct 2.1 (Universal Map-to-Raceline Momentum Tracker)
-Standalone Single-File Controller Node
 
-Features:
-- 100% Universal & Standalone: Zero embedded waypoints, zero external file dependencies
-- Real-Time Map-to-Raceline Generator (/map OccupancyGrid + /ego_racecar/odom initial pose):
-  1. Automatic track loop extraction & open SLAM doorway sealing via Euclidean Distance Transform
-  2. Jordan Curve inner/outer boundary separation & morphological obstacle-protrusion opening
-  3. Zero-level-set contour tracing (Moore-Neighbor 8-connected boundary tracer, zero OpenCV needed)
-  4. Vectorized 2-pass periodic Dynamic Programming (DP) corridor slalom optimization
-  5. Frenet 1D lateral offset smoothing, 2D corner rounding, and periodic cubic B-spline resampling
-- Pure Differential Geometry Speed Profiling: v(s) = sqrt(a_lat_max / kappa(s))
-- Bidirectional kinematic braking (a_brake) and acceleration (a_accel) integration passes
-- Active LiDAR Perception & Forward Collision Envelope (/scan):
-  Parallel side walls never trigger slowdowns; full 5.80 m/s acceleration when path ahead is clear
-- Kinematic Stanley Tracking with Active Gyro Yaw Damping
-"""
 
 import math
 import time
@@ -140,11 +121,7 @@ class UltraInstinct21Controller(Node):
 
     @staticmethod
     def _trace_outer_contour(mask_bool: np.ndarray) -> np.ndarray:
-        """
-        Pure-Python Moore-Neighbor 8-connected boundary tracer.
-        Extracts the ordered closed outer contour (col, row) of the largest connected component
-        in `mask_bool` without requiring OpenCV (cv2).
-        """
+
         ih_labels, _ = label(mask_bool, structure=np.ones((3, 3), dtype=int))
         ih_sizes = np.bincount(ih_labels.ravel())
         ih_sizes[0] = 0
@@ -176,11 +153,7 @@ class UltraInstinct21Controller(Node):
         return np.array(contour, dtype=np.float64)
 
     def _generate_raceline_from_map(self, msg: OccupancyGrid, sx: float, sy: float, stheta: float) -> np.ndarray:
-        """
-        Universal Map-to-Raceline Generator:
-        Synthesizes a smooth, collision-free, curvature-minimized closed-loop raceline
-        directly from any 2D OccupancyGrid and the vehicle's starting pose (sx, sy, stheta).
-        """
+
         w_full = int(msg.info.width)
         h_full = int(msg.info.height)
         res = float(msg.info.resolution)
@@ -454,10 +427,7 @@ class UltraInstinct21Controller(Node):
         )
 
     def _compute_universal_geometry(self):
-        """
-        Computes path headings, circumscribed curvatures, and segment lengths
-        using purely relative differential geometry (zero track coordinates).
-        """
+
         n = self.num_pts
         headings = np.zeros(n, dtype=np.float32)
         curvatures = np.zeros(n, dtype=np.float32)
@@ -484,12 +454,7 @@ class UltraInstinct21Controller(Node):
         return headings, curvatures, ds
 
     def _build_universal_velocity_profile(self):
-        """
-        Universal Physics Speed Profiler:
-        Computes maximum permissible speed based on lateral tire friction limits (v = sqrt(a_lat / kappa)),
-        backward kinematic braking integration, and forward kinematic acceleration integration.
-        Operates without any map-specific or coordinate-specific conditions.
-        """
+
         n = self.num_pts
 
         # Light 3-point noise filter (preserves true peak curvature in slaloms)
@@ -522,13 +487,7 @@ class UltraInstinct21Controller(Node):
         return v_targets
 
     def scan_cb(self, scan: LaserScan):
-        """
-        Active LiDAR Perception & Forward Collision Envelope:
-        Projects LiDAR rays into the vehicle frame (x=forward, y=lateral).
-        Checks the vehicle forward travel corridor (|y| <= 0.22m, x > 0.10m).
-        Walls parallel to the car (to the side) NEVER trigger deceleration,
-        allowing full acceleration to maximum speed when the path ahead is clear.
-        """
+
         ranges = np.array(scan.ranges, dtype=np.float32)
         angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
 
