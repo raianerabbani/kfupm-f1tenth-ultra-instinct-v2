@@ -13,9 +13,9 @@
 
 ## Architecture Overview
 - **Zero Hardcoded Waypoints or Track Coordinates:** Dynamically extracts the track topology and synthesizes an obstacle-avoiding $C^2$ cubic B-spline raceline from `/map` (`nav_msgs/msg/OccupancyGrid`) and `/ego_racecar/odom` (`nav_msgs/msg/Odometry`) in ~0.17 s using Euclidean Distance Transforms and periodic Dynamic Programming.
-- **Universal Physics Speed Profiler:** Computes curvature-limited corner velocities ($v = \sqrt{a_{\text{lat}} / \kappa}$) with bidirectional kinematic braking/acceleration integration passes (`v_max_straight = 5.80 m/s`, `v_corner_floor = 2.35 m/s`).
-- **Active LiDAR Forward Collision Envelope (`/scan`):** Monitors the forward travel corridor ($x > 0.10\,\text{m}, |y| \le 0.22\,\text{m}$) without slowing down next to parallel side walls.
-- **Kinematic Stanley + Active Gyro Damping:** Front-axle preview tracking with yaw-rate damping (`k_h = 0.85`, `k_e = 2.80`, `k_yaw = 0.018`).
+- **Universal Physics Speed Profiler:** Computes curvature-limited corner velocities ($v = \sqrt{a_{\text{lat}} / \kappa}$) with combined friction-circle and powertrain acceleration/braking integration (`v_max_straight = 18.0 m/s`, `v_corner_floor = 3.80 m/s`, `a_lat_max = 12.0 m/s^2`).
+- **Active LiDAR Forward Collision Envelope (`/scan`):** Monitors the forward travel corridor ($x > 0.08\,\text{m}, |y| \le 0.13\,\text{m}$) without slowing down next to parallel side walls.
+- **Asymmetric Feedforward + Stanley + Active Gyro Damping:** Kinematic Ackermann feedforward with asymmetric turn-in anticipation, short async pose lead, front-axle preview Stanley control, and yaw-rate damping (`k_h = 1.08`, `k_e = 4.20`, `k_yaw = 0.026`).
 
 ## Local Verification (Clean Empty Workspace)
 ```bash

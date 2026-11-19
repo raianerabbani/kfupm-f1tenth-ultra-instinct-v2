@@ -23,28 +23,36 @@ class UltraInstinct21Controller(Node):
     def __init__(self):
         super().__init__('controller')
 
-        # Vehicle Kinematics
-        self.wheelbase = 0.33
+        # Vehicle Kinematics (true F1TENTH Single-Track parameters)
+        self.wheelbase = 0.3302
         self.max_steer = 0.4189  # ~24 degrees (max servo limit)
 
-        # Physical Acceleration & Velocity Limits (Universal Invariants)
-        self.v_max_straight = 5.80   # Full throttle on all open straightaways (m/s)
-        self.v_corner_floor = 2.35   # Apex momentum preservation floor (m/s)
-        self.a_lat_max = 5.40        # Physical lateral tire acceleration budget (m/s^2)
-        self.a_brake = 4.20          # Kinetic energy preserving deceleration (m/s^2)
-        self.a_accel = 5.50          # Punchy corner-exit acceleration (m/s^2)
+        # Physical Acceleration & Velocity Limits (Universal Friction Circle + Powertrain)
+        self.v_max_straight = 18.0   # Uncapped straightaway speed limit (m/s)
+        self.v_corner_floor = 3.80   # Apex momentum preservation floor (m/s)
+        self.a_lat_max = 12.0        # Lateral tire acceleration budget (m/s^2)
+        self.a_brake = 9.5           # Braking tire deceleration envelope (m/s^2)
+        self.a_accel = 9.51          # Peak motor acceleration (m/s^2)
+        self.v_switch = 7.319        # Motor power-limited inflection speed (m/s)
+        self.br_time = 0.100         # Forward braking lookahead time (s)
+        self.raw_curv_w = 0.35       # Raw curvature spike blend weight
 
-        # Stanley Tracking & Active Gyro Damping Gains
-        self.k_h = 0.85              # Heading error gain
-        self.k_e = 2.80              # Cross-track error gain
-        self.k_soft = 0.50           # Low-speed softening constant
-        self.k_yaw = 0.018           # Active gyro yaw-rate damping gain
+        # Stanley + Asymmetric Feedforward + Active Gyro Damping + Async Delay Compensation
+        self.k_ff = 0.76             # Kinematic Ackermann feedforward gain
+        self.k_us = 0.0025           # Understeer velocity-squared gradient
+        self.k_h = 1.08              # Heading error gain
+        self.k_e = 4.20              # Cross-track error gain
+        self.k_yaw = 0.026           # Active gyro yaw-rate damping gain
+        self.dt_lead = 0.010         # Async odometry-to-actuation lead prediction (s)
+        self.ff_t = 0.075            # Asymmetric turn-in curvature lookahead (s)
+        self.pid_accel_gain = 3.5    # Corner-exit throttle response gain
 
         # Dynamic Raceline State (populated automatically from /map + /ego_racecar/odom)
         self.wps = None
         self.num_pts = 0
         self.headings = None
         self.curvatures = None
+        self.signed_k_s = None
         self.ds = None
         self.v_profile = None
         self.raceline_ready = False
@@ -90,11 +98,17 @@ class UltraInstinct21Controller(Node):
             self.scan_cb,
             qos_profile=qos_profile_sensor_data,
         )
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.odom_sub = self.create_subscription(
             Odometry,
             '/ego_racecar/odom',
             self.odom_cb,
-            10,
+            qos_profile=odom_qos,
         )
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped,
@@ -188,7 +202,7 @@ class UltraInstinct21Controller(Node):
         c0 = int(np.clip(round((sx - ox_sub) / res), 0, W - 1))
         r0 = int(np.clip(round((sy - oy_sub) / res), 0, H - 1))
         local_r = float(dist_m[max(0, r0 - 15):min(H, r0 + 16), max(0, c0 - 15):min(W, c0 + 16)].max())
-        max_track_half_width = max(3.5, local_r * 2.0)
+        max_track_half_width = max(2.6, local_r * 1.85)
 
         ext_core = dist_m > max_track_half_width
         if np.any(ext_core):
@@ -196,7 +210,7 @@ class UltraInstinct21Controller(Node):
         else:
             exterior_void = np.zeros_like(walls)
 
-        # 4. Identify and remove small isolated obstacle islands (< 3.5 m^2) to extract clean track topology
+        # 4. Identify and remove small isolated obstacle islands (< 1.5 m^2) to extract clean track topology
         non_track = walls | exterior_void
         non_track[0, :] = True
         non_track[-1, :] = True
@@ -205,7 +219,7 @@ class UltraInstinct21Controller(Node):
 
         wall_labels, _ = label(non_track, structure=np.ones((3, 3), dtype=int))
         comp_sizes = np.bincount(wall_labels.ravel())
-        max_obs_pixels = int(round(3.5 / (res ** 2)))
+        max_obs_pixels = int(round(1.5 / (res ** 2)))
         is_small_obs = (wall_labels > 0) & (comp_sizes[wall_labels] < max_obs_pixels)
 
         clean_walls = non_track & (~is_small_obs)
@@ -356,7 +370,7 @@ class UltraInstinct21Controller(Node):
         req_c = np.minimum(0.35, np.maximum(0.24, dist_m[cpy0, cpx0] - 0.01))
 
         for stride in [8, 4, 2, 1]:
-            for _ in range(35):
+            for _ in range(45):
                 mid_u = 0.5 * (np.roll(smoothed_u, stride) + np.roll(smoothed_u, -stride))
                 cand_u = smoothed_u + 0.35 * (mid_u - smoothed_u)
                 cx_u = raw_pts[:, 0] + cand_u * normals[:, 0]
@@ -366,7 +380,7 @@ class UltraInstinct21Controller(Node):
                 valid = track_mask[cpy, cpx] & (~walls[cpy, cpx]) & (dist_m[cpy, cpx] >= req_c)
                 smoothed_u[valid] = cand_u[valid]
 
-        safe_pts = raw_pts + normals * gaussian_filter1d(smoothed_u, sigma=1.5, mode='wrap')[:, None]
+        safe_pts = raw_pts + normals * gaussian_filter1d(smoothed_u, sigma=1.8, mode='wrap')[:, None]
 
         cpx0 = np.clip(np.round((safe_pts[:, 0] - ox_sub) / res).astype(int), 0, W - 1)
         cpy0 = np.clip(np.round((safe_pts[:, 1] - oy_sub) / res).astype(int), 0, H - 1)
@@ -393,7 +407,7 @@ class UltraInstinct21Controller(Node):
             opt_pts[need, 0] += (0.26 - c_val[need]) * grad_x[cpy[need], cpx[need]]
             opt_pts[need, 1] += (0.26 - c_val[need]) * grad_y[cpy[need], cpx[need]]
 
-        tck, _ = splprep([opt_pts[:, 0], opt_pts[:, 1]], s=0.005, per=True)
+        tck, _ = splprep([opt_pts[:, 0], opt_pts[:, 1]], s=0.008, per=True)
         u_dense = np.linspace(0.0, 1.0, 5000)
         xd, yd = splev(u_dense, tck)
         cum_s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xd), np.diff(yd)))])
@@ -414,7 +428,7 @@ class UltraInstinct21Controller(Node):
         sx, sy, stheta = self.init_pose
         self.wps = self._generate_raceline_from_map(self.map_msg, sx, sy, stheta)
         self.num_pts = len(self.wps)
-        self.headings, self.curvatures, self.ds = self._compute_universal_geometry()
+        self.headings, self.curvatures, self.signed_k_s, self.ds = self._compute_universal_geometry()
         self.v_profile = self._build_universal_velocity_profile()
         self.last_closest_idx = 0
         self.raceline_ready = True
@@ -426,10 +440,11 @@ class UltraInstinct21Controller(Node):
         )
 
     def _compute_universal_geometry(self):
-
+        """Computes path headings, unsigned/signed Menger curvatures, and segment lengths."""
         n = self.num_pts
         headings = np.zeros(n, dtype=np.float32)
         curvatures = np.zeros(n, dtype=np.float32)
+        signed_k = np.zeros(n, dtype=np.float32)
         ds = np.zeros(n, dtype=np.float32)
 
         for i in range(n):
@@ -442,55 +457,52 @@ class UltraInstinct21Controller(Node):
             headings[i] = math.atan2(dy, dx)
             ds[i] = math.hypot(dx, dy)
 
-            # Menger circumscribed curvature of 3 consecutive points
-            a = math.hypot(p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
-            b = math.hypot(p_next[0] - p_curr[0], p_next[1] - p_curr[1])
-            c = math.hypot(p_next[0] - p_prev[0], p_next[1] - p_prev[1])
-            s = (a + b + c) / 2.0
-            area = math.sqrt(max(0.0, s * (s - a) * (s - b) * (s - c)))
-            curvatures[i] = (4.0 * area) / max(1e-5, a * b * c)
+            v1 = p_curr - p_prev
+            v2 = p_next - p_curr
+            v3 = p_next - p_prev
+            denom = max(1e-6, float(np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(v3)))
+            signed_k[i] = float(2.0 * (v1[0] * v2[1] - v1[1] * v2[0])) / denom
+            curvatures[i] = abs(signed_k[i])
 
-        return headings, curvatures, ds
+        signed_k_s = np.convolve(np.pad(signed_k, 2, mode='wrap'), np.ones(5) / 5.0, mode='valid').astype(np.float32)
+        return headings, curvatures, signed_k_s, ds
 
     def _build_universal_velocity_profile(self):
-
+        """Builds bidirectional friction-circle + powertrain velocity profile."""
         n = self.num_pts
+        kc = np.convolve(np.pad(self.curvatures, 2, mode='wrap'), np.ones(5) / 5.0, mode='valid')
+        k_eff_arr = np.maximum(kc, self.raw_curv_w * self.curvatures)
 
-        # Light 3-point noise filter (preserves true peak curvature in slaloms)
-        win = 1
-        padded = np.pad(self.curvatures, win, mode='wrap')
-        k_clean = np.convolve(padded, np.ones(2 * win + 1) / (2 * win + 1), mode='valid')
+        v_targets = np.array(
+            [max(self.v_corner_floor, min(self.v_max_straight, math.sqrt(self.a_lat_max / max(0.005, float(kc[i]))))) for i in range(n)],
+            dtype=np.float32,
+        )
 
-        v_targets = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            k_eff = max(0.038, float(k_clean[i]))
-            v_corner = math.sqrt(self.a_lat_max / k_eff)
-            v_targets[i] = max(self.v_corner_floor, min(self.v_max_straight, v_corner))
-
-        # Backward deceleration pass (kinematic energy preservation)
-        for _ in range(4):
+        al2 = self.a_lat_max ** 2
+        for _ in range(6):
+            # Backward deceleration pass respecting combined friction circle
             for i in range(n - 1, -1, -1):
                 next_i = (i + 1) % n
-                v_lim = math.sqrt(v_targets[next_i] ** 2 + 2.0 * self.a_brake * self.ds[i])
-                if v_targets[i] > v_lim:
-                    v_targets[i] = v_lim
+                ay = float(k_eff_arr[i]) * (float(v_targets[next_i]) ** 2)
+                ax_b = min(self.a_brake, math.sqrt(max(2.0, al2 - min(al2 - 2.0, ay ** 2))))
+                v_targets[i] = min(v_targets[i], math.sqrt(float(v_targets[next_i]) ** 2 + 2.0 * ax_b * float(self.ds[i])))
 
-        # Forward acceleration pass onto straightaways
-        for _ in range(4):
+            # Forward acceleration pass respecting combined friction circle and powertrain curve
             for i in range(n):
                 next_i = (i + 1) % n
-                v_lim = math.sqrt(v_targets[i] ** 2 + 2.0 * self.a_accel * self.ds[i])
-                if v_targets[next_i] > v_lim:
-                    v_targets[next_i] = v_lim
+                ay = float(k_eff_arr[i]) * (float(v_targets[i]) ** 2)
+                ax_g = math.sqrt(max(2.0, al2 - min(al2 - 2.0, ay ** 2)))
+                ax_p = self.a_accel * min(1.0, self.v_switch / max(0.5, float(v_targets[i])))
+                v_targets[next_i] = min(v_targets[next_i], math.sqrt(float(v_targets[i]) ** 2 + 2.0 * min(ax_g, ax_p) * float(self.ds[i])))
 
         return v_targets
 
     def scan_cb(self, scan: LaserScan):
-
+        """Computes minimum obstacle clearance inside the forward travel corridor."""
         ranges = np.array(scan.ranges, dtype=np.float32)
         angles = scan.angle_min + np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
 
-        valid = (ranges > 0.08) & (ranges < 15.0) & (~np.isnan(ranges)) & (~np.isinf(ranges))
+        valid = (ranges > 0.05) & (ranges < 15.0) & (~np.isnan(ranges)) & (~np.isinf(ranges))
         r_val = ranges[valid]
         th_val = angles[valid]
 
@@ -498,9 +510,9 @@ class UltraInstinct21Controller(Node):
         x_pts = r_val * np.cos(th_val)
         y_pts = r_val * np.sin(th_val)
 
-        # Forward travel corridor (vehicle width 0.30m -> half-width 0.22m with buffer)
-        corridor_half_width = 0.22
-        in_travel_path = (x_pts > 0.10) & (np.abs(y_pts) <= corridor_half_width)
+        # Forward travel corridor narrow envelope
+        corridor_half_width = 0.13
+        in_travel_path = (x_pts > 0.08) & (np.abs(y_pts) <= corridor_half_width)
 
         if np.any(in_travel_path):
             self.d_forward_clearance = float(np.min(x_pts[in_travel_path]))
@@ -508,25 +520,31 @@ class UltraInstinct21Controller(Node):
             self.d_forward_clearance = 10.0
 
     def odom_cb(self, odom: Odometry):
+        """Computes steering and speed commands with async lead and asymmetric feedforward."""
         # 1. Vehicle Pose, Heading, and Angular Velocity
-        xc = odom.pose.pose.position.x
-        yc = odom.pose.pose.position.y
+        xc0 = odom.pose.pose.position.x
+        yc0 = odom.pose.pose.position.y
         q = odom.pose.pose.orientation
-        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        yaw0 = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         yaw_rate = odom.twist.twist.angular.z
         self.current_speed = math.hypot(odom.twist.twist.linear.x, odom.twist.twist.linear.y)
 
         # Capture initial pose and synthesize raceline if /map has arrived
         if self.init_pose is None:
-            self.init_pose = (xc, yc, yaw)
+            self.init_pose = (xc0, yc0, yaw0)
             if self.map_msg is not None and not self.raceline_ready:
                 self._initialize_raceline()
 
         if not self.raceline_ready:
             return
 
-        # 2. Dynamic Front Axle Preview (scales smoothly with velocity)
-        preview_dist = max(0.12, min(0.20, 0.10 + 0.02 * self.current_speed))
+        # 2. Short async pose lead + Dynamic Front Axle Preview
+        dt_l = self.dt_lead
+        yaw = yaw0 + yaw_rate * dt_l
+        xc = xc0 + self.current_speed * dt_l * math.cos(yaw0 + 0.5 * yaw_rate * dt_l)
+        yc = yc0 + self.current_speed * dt_l * math.sin(yaw0 + 0.5 * yaw_rate * dt_l)
+
+        preview_dist = max(0.12, min(0.24, 0.10 + 0.015 * self.current_speed))
         xf = xc + (self.wheelbase + preview_dist) * math.cos(yaw)
         yf = yc + (self.wheelbase + preview_dist) * math.sin(yaw)
 
@@ -552,36 +570,40 @@ class UltraInstinct21Controller(Node):
         # Heading error wrapped to [-pi, pi]
         theta_e = math.atan2(math.sin(psi_p - yaw), math.cos(psi_p - yaw))
 
-        # 5. Kinematic Control Law with Active Gyro Yaw Damping
-        steer_fb = math.atan2(-self.k_e * e_y, self.current_speed + self.k_soft)
+        # 5. Kinematic Ackermann Feedforward (asymmetric turn-in anticipation) + Stanley + Gyro Damping
+        idx_ff = (idx + int(round(self.ff_t * self.current_speed / 0.10))) % self.num_pts
+        k0, k1 = float(self.signed_k_s[idx]), float(self.signed_k_s[idx_ff])
+        k_ff = (0.45 * k0 + 0.55 * k1) if (abs(k1) >= abs(k0) or k0 * k1 < 0) else (0.85 * k0 + 0.15 * k1)
+        steer_ff = self.k_ff * math.atan(self.wheelbase * k_ff) + self.k_us * (self.current_speed ** 2) * k_ff
+        steer_fb = math.atan2(-self.k_e * e_y, 0.5 * self.current_speed + 0.6)
         steer_damp = -self.k_yaw * yaw_rate
 
-        total_steer = self.k_h * theta_e + steer_fb + steer_damp
+        total_steer = steer_ff + self.k_h * theta_e + steer_fb + steer_damp
         steer_cmd = float(np.clip(total_steer, -self.max_steer, self.max_steer))
         self.last_steer = steer_cmd
 
-        # 6. Geometric Velocity Lookup
-        # When path ahead is clear, accelerates to full straightaway speed (5.80 m/s)
-        brake_pts = max(2, min(5, int(self.current_speed * 0.15 / 0.20) + 1))
-        target_v = min(self.v_profile[(idx + k) % self.num_pts] for k in range(min(brake_pts, self.num_pts)))
+        # 6. Geometric Velocity Lookup + Exit Throttle Saturation
+        brake_pts = max(2, min(12, int(self.current_speed * self.br_time / 0.10) + 1))
+        target_v = min(float(self.v_profile[(idx + k) % self.num_pts]) for k in range(min(brake_pts, self.num_pts)))
         target_v = min(self.v_max_straight, target_v)
 
-        # 7. Direction-of-Travel Collision Safety Override (Active LiDAR AEB)
-        # Decelerates ONLY if an obstacle or wall is directly in the forward travel corridor
-        if self.d_forward_clearance < 0.50:
-            target_v = min(target_v, 1.80)
-        if self.d_forward_clearance < 0.32:
-            target_v = 0.0  # Immediate full stop
+        if target_v > self.current_speed + 0.05:
+            cmd_v = min(20.0, self.current_speed + (target_v - self.current_speed) * self.pid_accel_gain)
+        else:
+            cmd_v = target_v
 
-        # Enforce minimum rolling floor
-        target_v = max(1.20, target_v)
+        # 7. Direction-of-Travel Collision Safety Envelope (Active LiDAR AEB, non-freezing)
+        if self.d_forward_clearance < 0.22:
+            cmd_v = max(1.20, min(cmd_v, 1.80))
+        elif self.d_forward_clearance < 0.34:
+            cmd_v = max(1.20, min(cmd_v, 2.80))
 
         # 8. Publish Drive Command
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'ego_racecar/base_link'
         msg.drive.steering_angle = steer_cmd
-        msg.drive.speed = float(target_v)
+        msg.drive.speed = float(cmd_v)
         self.drive_pub.publish(msg)
 
 
